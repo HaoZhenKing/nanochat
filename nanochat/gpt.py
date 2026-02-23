@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW, PureAdamW, SOAPAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -345,7 +345,11 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
+                        adam_betas=(0.8, 0.95), scalar_lr=0.5,
+                        optimizer_type='muon', muon_ns_steps=5,
+                        precondition_frequency=10, max_precond_dim=10000,
+                        soap_betas=(0.95, 0.95)):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -362,24 +366,49 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        # Build param_groups with all required fields explicit
+        # AdamW groups for non-matrix params (shared across all optimizer_type variants)
         param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
 
-        Factory = DistMuonAdamW if ddp else MuonAdamW
+        if optimizer_type == 'muon':
+            # Matrix params use Muon (grouped by shape for stacking)
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=muon_ns_steps, beta2=0.95, weight_decay=weight_decay,
+                ))
+            Factory = DistMuonAdamW if ddp else MuonAdamW
+
+        elif optimizer_type == 'adamw':
+            # Matrix params also use AdamW (pure AdamW baseline)
+            param_groups.append(dict(
+                kind='adamw', params=matrix_params, lr=matrix_lr * dmodel_lr_scale,
+                betas=adam_betas, eps=1e-10, weight_decay=weight_decay,
+            ))
+            Factory = PureAdamW
+
+        elif optimizer_type == 'soap':
+            # Matrix params use SOAP (per-param, no shape grouping needed)
+            param_groups.append(dict(
+                kind='soap', params=matrix_params, lr=matrix_lr,
+                betas=soap_betas, eps=1e-8, weight_decay=weight_decay,
+                precondition_frequency=precondition_frequency,
+                max_precond_dim=max_precond_dim,
+                shampoo_beta=-1,  # use betas[1] as shampoo_beta
+                correct_bias=True,
+            ))
+            Factory = SOAPAdamW
+
+        else:
+            raise ValueError(f"Unknown optimizer_type: {optimizer_type!r}. Must be 'muon', 'adamw', or 'soap'.")
+
+        print0(f"Using optimizer: {Factory.__name__} (type={optimizer_type})")
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]

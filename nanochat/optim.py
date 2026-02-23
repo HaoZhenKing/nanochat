@@ -531,3 +531,312 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+# -----------------------------------------------------------------------------
+# Pure AdamW optimizer (all params use AdamW, no Muon).
+# Used as a standard baseline for optimizer comparison experiments.
+
+class PureAdamW(torch.optim.Optimizer):
+    """
+    Pure AdamW optimizer for all parameters (including matrix params).
+    Used as the industry-standard baseline in optimizer comparison experiments.
+
+    Unlike MuonAdamW which routes matrix params through Muon, this applies the
+    same fused AdamW kernel to every parameter group. The param_groups still use
+    the 'kind' field for compatibility with nanochat's setup_optimizer, but all
+    groups are treated as 'adamw'.
+
+    Arguments:
+        param_groups: List of dicts, each containing:
+            - 'params': List of parameters
+            - 'kind': always 'adamw'
+            - 'lr', 'betas', 'eps', 'weight_decay'
+    """
+    def __init__(self, param_groups: list[dict]):
+        super().__init__(param_groups, defaults={})
+        self._step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+
+                if not state:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+                state['step'] += 1
+
+                self._step_t.fill_(state['step'])
+                self._lr_t.fill_(group['lr'])
+                self._beta1_t.fill_(group['betas'][0])
+                self._beta2_t.fill_(group['betas'][1])
+                self._eps_t.fill_(group['eps'])
+                self._wd_t.fill_(group['weight_decay'])
+
+                adamw_step_fused(
+                    p, grad, state['exp_avg'], state['exp_avg_sq'],
+                    self._step_t, self._lr_t, self._beta1_t,
+                    self._beta2_t, self._eps_t, self._wd_t,
+                )
+
+# -----------------------------------------------------------------------------
+"""
+SOAP optimizer: ShampoO with Adam in the Preconditioner's eigenbasis.
+https://arxiv.org/abs/2409.11321
+Reference implementation: https://github.com/nikhilvyas/SOAP
+
+SOAP combines Shampoo's powerful Kronecker-factored preconditioning with Adam's
+adaptive learning rates. Key insight: Shampoo (1/2 power) is equivalent to
+running Adafactor in its preconditioner's eigenbasis. SOAP exploits this by:
+  1. Periodically computing eigenbases of Kronecker factors (every precondition_frequency steps)
+  2. Running standard Adam in the rotated coordinate system between updates
+  3. Projecting updates back to original parameter space
+
+This adds only one hyperparameter (precondition_frequency) compared to Adam.
+"""
+
+from itertools import chain
+
+class SOAPAdamW(torch.optim.Optimizer):
+    """
+    Combined optimizer: SOAP for 2D matrix params, AdamW for others.
+
+    For matrix parameters (kind='soap'), uses the full SOAP algorithm with
+    Kronecker-factored preconditioning and eigendecomposition. For non-matrix
+    parameters (kind='adamw'), falls back to standard fused AdamW.
+
+    Arguments:
+        param_groups: List of dicts, each containing:
+            - 'params': List of parameters
+            - 'kind': 'adamw' or 'soap'
+            - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
+            - For SOAP groups: 'lr', 'betas', 'eps', 'weight_decay',
+                               'precondition_frequency', 'correct_bias',
+                               'shampoo_beta', 'max_precond_dim'
+    """
+    def __init__(self, param_groups: list[dict]):
+        super().__init__(param_groups, defaults={})
+        # 0-D CPU tensors for AdamW (avoids recompilation)
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    # ---- AdamW step (reuse fused kernel) ----
+
+    def _step_adamw(self, group: dict) -> None:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            state['step'] += 1
+
+            self._adamw_step_t.fill_(state['step'])
+            self._adamw_lr_t.fill_(group['lr'])
+            self._adamw_beta1_t.fill_(group['betas'][0])
+            self._adamw_beta2_t.fill_(group['betas'][1])
+            self._adamw_eps_t.fill_(group['eps'])
+            self._adamw_wd_t.fill_(group['weight_decay'])
+
+            adamw_step_fused(
+                p, grad, state['exp_avg'], state['exp_avg_sq'],
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+
+    # ---- SOAP preconditioner methods ----
+
+    def _init_preconditioner(self, grad: Tensor, state: dict, group: dict) -> None:
+        """Initialize Kronecker-factored preconditioner matrices (L, R in the paper)."""
+        shampoo_beta = group.get('shampoo_beta', -1)
+        if shampoo_beta < 0:
+            shampoo_beta = group['betas'][1]
+        max_precond_dim = group.get('max_precond_dim', 10000)
+
+        state['GG'] = []  # Kronecker factor matrices
+        for sh in grad.shape:
+            if sh > max_precond_dim:
+                state['GG'].append([])
+            else:
+                state['GG'].append(torch.zeros(sh, sh, device=grad.device, dtype=torch.float32))
+
+        state['Q'] = None  # Eigenbases (computed on first update)
+        state['shampoo_beta'] = shampoo_beta
+
+    def _project(self, grad: Tensor, state: dict, max_precond_dim: int) -> Tensor:
+        """Project gradient into the eigenbasis of the preconditioner."""
+        for mat in state['Q']:
+            if len(mat) > 0:
+                grad = torch.tensordot(grad, mat, dims=[[0], [0]])
+            else:
+                permute_order = list(range(1, len(grad.shape))) + [0]
+                grad = grad.permute(permute_order)
+        return grad
+
+    def _project_back(self, grad: Tensor, state: dict, max_precond_dim: int) -> Tensor:
+        """Project gradient back from eigenbasis to original space."""
+        for mat in state['Q']:
+            if len(mat) > 0:
+                grad = torch.tensordot(grad, mat, dims=[[0], [1]])
+            else:
+                permute_order = list(range(1, len(grad.shape))) + [0]
+                grad = grad.permute(permute_order)
+        return grad
+
+    def _get_orthogonal_matrix(self, GG: list) -> list:
+        """Compute eigenbases via eigendecomposition (used on first step)."""
+        final = []
+        for m in GG:
+            if len(m) == 0:
+                final.append([])
+                continue
+            m_float = m.float()
+            try:
+                _, Q = torch.linalg.eigh(m_float + 1e-30 * torch.eye(m_float.shape[0], device=m_float.device))
+            except Exception:
+                _, Q = torch.linalg.eigh(m_float.to(torch.float64) + 1e-30 * torch.eye(m_float.shape[0], device=m_float.device))
+                Q = Q.float()
+            Q = torch.flip(Q, [1])
+            final.append(Q)
+        return final
+
+    def _get_orthogonal_matrix_qr(self, state: dict, max_precond_dim: int) -> list:
+        """Update eigenbases via power iteration + QR (used on subsequent updates)."""
+        final = []
+        for ind, (m, o) in enumerate(zip(state['GG'], state['Q'])):
+            if len(m) == 0:
+                final.append([])
+                continue
+            m_float = m.float()
+            o_float = o.float()
+            # Sort eigenvectors by estimated eigenvalues (descending)
+            est_eig = torch.diag(o_float.T @ m_float @ o_float)
+            sort_idx = torch.argsort(est_eig, descending=True)
+            # Reorder exp_avg_sq along this dimension
+            state['exp_avg_sq'] = state['exp_avg_sq'].index_select(ind, sort_idx)
+            o_float = o_float[:, sort_idx]
+            # One round of power iteration + QR
+            power_iter = m_float @ o_float
+            Q, _ = torch.linalg.qr(power_iter)
+            final.append(Q)
+        return final
+
+    def _update_preconditioner(self, grad: Tensor, state: dict, group: dict) -> None:
+        """Update Kronecker factors and (periodically) recompute eigenbases."""
+        max_precond_dim = group.get('max_precond_dim', 10000)
+        precondition_frequency = group.get('precondition_frequency', 10)
+
+        # Project exp_avg back to original space before updating Q
+        if state['Q'] is not None:
+            state['exp_avg'] = self._project_back(state['exp_avg'], state, max_precond_dim)
+
+        # Update Kronecker factors: GG[k] = EMA of outer products along dimension k
+        for idx, sh in enumerate(grad.shape):
+            if sh <= max_precond_dim:
+                outer_product = torch.tensordot(
+                    grad.float(), grad.float(),
+                    dims=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
+                )
+                state['GG'][idx].lerp_(outer_product, 1 - state['shampoo_beta'])
+
+        # Compute or update eigenbases
+        if state['Q'] is None:
+            state['Q'] = self._get_orthogonal_matrix(state['GG'])
+        elif state['step'] > 0 and state['step'] % precondition_frequency == 0:
+            state['Q'] = self._get_orthogonal_matrix_qr(state, max_precond_dim)
+
+        # Project exp_avg to the (potentially updated) eigenbasis
+        if state['step'] > 0:
+            state['exp_avg'] = self._project(state['exp_avg'], state, max_precond_dim)
+
+    # ---- SOAP step ----
+
+    def _step_soap(self, group: dict) -> None:
+        """
+        SOAP update for each matrix param individually.
+        Flow: project grad → Adam in eigenbasis → project back → weight decay → update.
+        """
+        max_precond_dim = group.get('max_precond_dim', 10000)
+
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+
+            if 'step' not in state:
+                state['step'] = 0
+
+            # State initialization
+            if 'exp_avg' not in state:
+                state['exp_avg'] = torch.zeros_like(grad)
+                state['exp_avg_sq'] = torch.zeros_like(grad)
+
+            # Initialize preconditioner on first step
+            if 'Q' not in state:
+                self._init_preconditioner(grad, state, group)
+                self._update_preconditioner(grad, state, group)
+                continue  # Skip first step: never use current grad in projection
+
+            # Project gradient to eigenbasis
+            grad_projected = self._project(grad, state, max_precond_dim)
+
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+            beta1, beta2 = group['betas']
+
+            state['step'] += 1
+
+            # Adam momentum updates in rotated space
+            exp_avg.lerp_(grad_projected, 1.0 - beta1)
+            exp_avg_sq.lerp_(grad_projected.square(), 1.0 - beta2)
+
+            # Compute Adam update
+            denom = exp_avg_sq.sqrt().add_(group['eps'])
+
+            step_size = group['lr']
+            if group.get('correct_bias', True):
+                bias_correction1 = 1.0 - beta1 ** state['step']
+                bias_correction2 = 1.0 - beta2 ** state['step']
+                step_size = step_size * (bias_correction2 ** 0.5) / bias_correction1
+
+            # Project update back to original space
+            norm_grad = self._project_back(exp_avg / denom, state, max_precond_dim)
+
+            # Parameter update
+            p.add_(norm_grad, alpha=-step_size)
+
+            # Decoupled weight decay
+            if group['weight_decay'] > 0.0:
+                p.add_(p, alpha=(-group['lr'] * group['weight_decay']))
+
+            # Update preconditioner AFTER the gradient step (avoid using current grad in projection)
+            self._update_preconditioner(grad, state, group)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group['kind'] == 'adamw':
+                self._step_adamw(group)
+            elif group['kind'] == 'soap':
+                self._step_soap(group)
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")

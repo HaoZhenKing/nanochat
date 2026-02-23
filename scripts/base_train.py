@@ -17,7 +17,9 @@ import gc
 import json
 import time
 import math
+import random
 import argparse
+import numpy as np
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
 
@@ -65,10 +67,19 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
+parser.add_argument("--warmup-ratio", type=float, default=0.05, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# Optimizer selection (experiment plan)
+parser.add_argument("--optimizer-type", type=str, default="muon", choices=["muon", "adamw", "soap"], help="optimizer type: muon (MuonAdamW), adamw (PureAdamW), soap (SOAPAdamW)")
+parser.add_argument("--soap-lr", type=float, default=3e-3, help="SOAP matrix learning rate (only used when --optimizer-type=soap)")
+parser.add_argument("--precondition-frequency", type=int, default=10, help="SOAP preconditioner update frequency")
+parser.add_argument("--soap-beta1", type=float, default=0.9, help="SOAP beta1 (experiment plan: fixed 0.9)")
+parser.add_argument("--soap-beta2", type=float, default=0.95, help="SOAP beta2")
+parser.add_argument("--seed", type=int, default=42, help="global random seed for reproducibility")
+parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz orthogonalization steps (default 5, for Ablation A)")
+parser.add_argument("--muon-warmdown-only-ortho", action="store_true", help="Only enable Muon orthogonalization during warmdown phase (Ablation A: 'strong tonic' hypothesis)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
@@ -86,6 +97,14 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+
+# Global random seed for reproducibility (per experiment plan §3.4)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+print0(f"Global random seed: {args.seed}")
+
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -299,17 +318,27 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
+# Initialize the Optimizer (supports muon/adamw/soap via --optimizer-type)
+optimizer_kwargs = dict(
+    # AdamW hyperparameters (shared across all types for non-matrix params)
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    optimizer_type=args.optimizer_type,
 )
+if args.optimizer_type == 'muon':
+    optimizer_kwargs['matrix_lr'] = args.matrix_lr * batch_lr_scale
+    optimizer_kwargs['muon_ns_steps'] = args.muon_ns_steps
+elif args.optimizer_type == 'adamw':
+    optimizer_kwargs['matrix_lr'] = args.matrix_lr * batch_lr_scale
+elif args.optimizer_type == 'soap':
+    optimizer_kwargs['matrix_lr'] = args.soap_lr * batch_lr_scale
+    optimizer_kwargs['precondition_frequency'] = args.precondition_frequency
+    optimizer_kwargs['soap_betas'] = (args.soap_beta1, args.soap_beta2)
+
+optimizer = model.setup_optimizer(**optimizer_kwargs)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -378,6 +407,13 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    step_times = [] # collect step times for P99/jitter analysis
+    # Experiment plan §5.4-5.6 metrics
+    nan_count = 0
+    loss_history = []  # rolling window for loss_variance
+    loss_spike_count = 0
+    loss_ema = 0.0
+    train_bpb_at_last_eval = None  # for generalization gap
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -385,6 +421,12 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    step_times = []  # reset step times on resume
+    nan_count = 0
+    loss_history = []
+    loss_spike_count = 0
+    loss_ema = 0.0
+    train_bpb_at_last_eval = None
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -410,12 +452,18 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        eval_log = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        # Generalization gap (§5.6)
+        if train_bpb_at_last_eval is not None:
+            gen_gap = val_bpb - train_bpb_at_last_eval
+            eval_log["val/generalization_gap"] = gen_gap
+            print0(f"Step {step:05d} | Generalization gap (val-train bpb): {gen_gap:.6f}")
+        wandb_run.log(eval_log)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -497,6 +545,23 @@ while True:
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+
+    # Compute grad_norm before optimizer step (§5.4)
+    grad_norm = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), max_norm=float('inf'))  # just measure, no clip
+    grad_norm_f = grad_norm.item()
+
+    # Snapshot weights for update-to-weight ratio (§5.5) every 100 steps
+    compute_uwr = (step % 100 == 0)
+    if compute_uwr:
+        weight_snapshots = {}
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    weight_snapshots[id(p)] = p.detach().clone()
+
+    synchronize()
+    t_before_opt = time.time()  # timing split for optimizer_overhead (§5.3)
+
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -506,13 +571,58 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+            # Warmdown-only orthogonalization: ns_steps=0 outside warmdown, restore during warmdown
+            if args.muon_warmdown_only_ortho:
+                warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
+                group["ns_steps"] = args.muon_ns_steps if step >= warmdown_start else 0
+        elif group['kind'] == 'soap':
+            # SOAP weight decay also linearly decays to zero
+            group["weight_decay"] = weight_decay_scaled * (1 - step / num_iterations)
     optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    synchronize()
+    t_after_opt = time.time()
+
+    # Compute update-to-weight ratio per layer (§5.5: per_layer_uwr)
+    uwr_log = {}
+    if compute_uwr:
+        uwr_by_kind = {}  # {kind: [uwr_values]}
+        for gi, group in enumerate(optimizer.param_groups):
+            kind = group.get('kind', 'unknown')
+            for pi, p in enumerate(group['params']):
+                pid = id(p)
+                if pid in weight_snapshots:
+                    w_old = weight_snapshots[pid]
+                    delta_norm = (p.detach() - w_old).norm().item()
+                    w_norm = w_old.norm().item()
+                    uwr = delta_norm / max(w_norm, 1e-12)
+                    uwr_by_kind.setdefault(kind, []).append(uwr)
+        # Log global stats
+        all_uwr = [v for vals in uwr_by_kind.values() for v in vals]
+        if all_uwr:
+            uwr_log["stability/uwr_mean"] = sum(all_uwr) / len(all_uwr)
+            uwr_log["stability/uwr_max"] = max(all_uwr)
+        # Log per-layer (by kind) stats
+        for kind, values in uwr_by_kind.items():
+            if values:
+                uwr_log[f"uwr/{kind}_mean"] = sum(values) / len(values)
+                uwr_log[f"uwr/{kind}_max"] = max(values)
+                uwr_log[f"uwr/{kind}_min"] = min(values)
+        del weight_snapshots
+
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    dt_fwdbwd = t_before_opt - t0
+    dt_opt = t_after_opt - t_before_opt
     # -------------------------------------------------------------------------
+
+    # NaN detection (§5.4)
+    if math.isnan(train_loss_f) or math.isinf(train_loss_f):
+        nan_count += 1
+        print0(f"WARNING: NaN/Inf loss detected at step {step} (total nan_count={nan_count})")
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
@@ -524,6 +634,23 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
+        step_times.append(dt)  # collect for P99/jitter analysis
+    # Calculate train_bpb for generalization gap tracking (§5.6)
+    train_bpb = train_loss_f * math.log2(math.e) / token_bytes
+    train_bpb_at_last_eval = train_bpb  # update snapshot for gen gap calculation
+
+    # Loss variance and spike detection (§5.4)
+    loss_history.append(train_loss_f)
+    if len(loss_history) > 100:
+        loss_history.pop(0)
+    loss_var = np.var(loss_history) if len(loss_history) >= 10 else 0.0
+    # Spike detection: > 2x the EMA
+    loss_ema = 0.95 * loss_ema + 0.05 * train_loss_f if loss_ema > 0 else train_loss_f
+    if train_loss_f > 2.0 * loss_ema and step > 10:
+        loss_spike_count += 1
+    # Optimizer overhead (§5.3)
+    opt_overhead = dt_opt / max(dt_fwdbwd, 1e-9)  # ratio of optimizer time to fwd+bwd time
+
     # Calculate ETA based on average time per step (excluding first 10 steps)
     steps_done = step - 10
     if steps_done > 0:
@@ -534,19 +661,36 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | grad_norm: {grad_norm_f:.4f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # Log every step: train_bpb, grad_norm (§5.3, §5.4, §5.6)
+    wandb_run.log({
+        "step": step,
+        "train/bpb": train_bpb,
+        "train/grad_norm": grad_norm_f,
+    })
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/bpb": train_bpb,
+            "train/grad_norm": grad_norm_f,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            # Stability metrics (§5.4)
+            "stability/loss_variance": loss_var,
+            "stability/loss_spikes": loss_spike_count,
+            "stability/nan_count": nan_count,
+            # System metrics (§5.3)
+            "system/optimizer_overhead": opt_overhead,
+            "system/dt_fwdbwd_ms": dt_fwdbwd * 1000,
+            "system/dt_opt_ms": dt_opt * 1000,
         }
+        log_data.update(uwr_log)  # update-to-weight ratio (§5.5)
         wandb_run.log(log_data)
 
     # state update
@@ -564,10 +708,23 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+peak_memory_mb = get_max_memory() / 1024 / 1024
+print0(f"Peak memory usage: {peak_memory_mb:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+# Step time distribution analysis (P99, jitter)
+if len(step_times) > 10:
+    step_times_arr = np.array(step_times)
+    avg_dt = step_times_arr.mean()
+    p99_dt = np.percentile(step_times_arr, 99)
+    jitter_cv = step_times_arr.std() / avg_dt if avg_dt > 0 else 0
+    print0(f"Step timing stats: avg={avg_dt*1000:.2f}ms | P99={p99_dt*1000:.2f}ms | jitter(CV)={jitter_cv:.4f}")
+    wandb_run.log({
+        "step_timing/avg_ms": avg_dt * 1000,
+        "step_timing/p99_ms": p99_dt * 1000,
+        "step_timing/jitter_cv": jitter_cv,
+    })
 
 # Log to report
 from nanochat.report import get_report
