@@ -244,6 +244,10 @@ def get_peak_flops(device_name: str) -> float:
         (["5090"], 209.5e12),
         (["4090"], 165.2e12),
         (["3090"], 71e12),
+        # Professional RTX
+        (["pro", "6000"], 405e12),    # RTX PRO 6000 Blackwell (96GB GDDR7)
+        (["rtx", "6000", "ada"], 91.1e12),  # RTX 6000 Ada (48GB GDDR6)
+        (["rtx", "6000"], 91.1e12),   # RTX 6000 Ada fallback
     )
     for patterns, flops in _PEAK_FLOPS_TABLE:
         if all(p in name for p in patterns):

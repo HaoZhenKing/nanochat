@@ -349,7 +349,7 @@ class GPT(nn.Module):
                         adam_betas=(0.8, 0.95), scalar_lr=0.5,
                         optimizer_type='muon', muon_ns_steps=5,
                         precondition_frequency=10, max_precond_dim=10000,
-                        soap_betas=(0.95, 0.95)):
+                        soap_betas=(0.9, 0.95)):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
